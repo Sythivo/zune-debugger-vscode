@@ -1,0 +1,21 @@
+.vscode/**/*
+.github/**/*
+.gitignore
+
+build/
+node_modules/
+
+tsconfig.json
+CHANGELOG.md
+
+**/*.js.map
+**/*.vsix
+
+src/**/*
+out/**/*
+test/**/*
+
+# devenv
+shell.nix
+.envrc
+.direnv/**/*

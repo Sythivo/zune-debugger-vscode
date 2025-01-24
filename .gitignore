@@ -1,0 +1,12 @@
+out
+dist
+node_modules
+*.vsix
+.DS_Store
+
+package-lock.json
+
+# devenv
+shell.nix
+.envrc
+.direnv

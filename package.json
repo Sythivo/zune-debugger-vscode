@@ -1,0 +1,142 @@
+{
+  "name": "zune-debugger-vscode",
+  "displayName": "Zune Luau Debugger",
+  "version": "0.0.1",
+  "publisher": "Sythivo",
+  "description": "Luau Debugger powered by Zune",
+  "author": {
+    "name": "Sythivo"
+  },
+  "license": "MIT",
+  "keywords": [],
+  "engines": {
+    "vscode": "^1.66.0"
+  },
+  "icon": "assets/icon-128x128.png",
+  "categories": [
+    "Debuggers"
+  ],
+  "bugs": {
+    "url": "https://github.com/Sythivo/zune-debugger-vscode/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sythivo/zune-debugger-vscode.git"
+  },
+  "private": true,
+  "scripts": {
+    "compile": "tsc -p ./",
+    "lint": "eslint src --ext ts",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --tsconfig=./tsconfig.json --external:vscode --format=cjs --platform=node --outfile=dist/extension.js",
+    "watch": "npm run -S esbuild-base -- --sourcemap --sources-content=false --watch",
+    "build": "npm run -S esbuild-base -- --sourcemap --sources-content=false --minify",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^14.14.37",
+    "@types/vscode": "^1.66.0",
+    "@typescript-eslint/eslint-plugin": "^5.17.0",
+    "@typescript-eslint/parser": "^5.17.0",
+    "@vscode/debugadapter": "^1.56.0",
+    "await-notify": "^1.0.1",
+    "esbuild": "^0.14.29",
+    "eslint": "^8.12.0",
+    "events": "^3.3.0",
+    "path-browserify": "^1.0.1",
+    "typescript": "^4.6.3",
+    "vsce": "^2.7.0"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onDebugResolve:zune-luau"
+  ],
+  "workspaceTrust": {
+    "request": "never"
+  },
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "luau"
+      },
+      {
+        "language": "lua"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "zune-luau",
+        "languages": [
+          "luau",
+          "lua"
+        ],
+        "label": "Zune Luau Debugger",
+        "program": "./out/debugAdapter.js",
+        "runtime": "node",
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute path to a luau file.",
+                "default": "${workspaceFolder}/path/to/file.luau"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory of the program to be debugged.",
+                "default": "${workspaceFolder}"
+              },
+              "args": {
+                "type": "array",
+                "description": "Arguments to pass to the program.",
+                "default": []
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Automatically stop after launch.",
+                "default": false
+              },
+              "debuggerPath": {
+                "type": "string",
+                "description": "Command to launch the debugger. Default is 'zune'.",
+                "default": "zune"
+              },
+              "debuggerArgs": {
+                "type": "array",
+                "description": "Arguments to pass to the debugger.",
+                "default": []
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "zune-luau",
+            "request": "launch",
+            "name": "Launch",
+            "program": "${workspaceFolder}/path/to/file.luau",
+            "args": [],
+            "stopOnEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Zune Debug: Launch",
+            "description": "A new configuration to debug luau file.",
+            "body": {
+              "type": "zune-luau",
+              "request": "launch",
+              "name": "Launch",
+              "program": "^\"\\${workspaceFolder}/path/to/file.luau\"",
+              "args": [],
+              "stopOnEntry": true
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
