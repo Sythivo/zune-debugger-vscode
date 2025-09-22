@@ -1,5 +1,5 @@
-# Zune Debugger VSCode
-A debugger for [Luau](https://luau.org), powered by [Zune (0.5+)](https://github.com/Scythe-Technology/Zune).
+# ZUNE Debugger VSCode
+A debugger for [Luau](https://luau.org), powered by [zune (0.5+)](https://github.com/Scythe-Technology/zune).
 
 ## Features
 - Basic debugging capabilities(breakpoints, step over, step into, step out).

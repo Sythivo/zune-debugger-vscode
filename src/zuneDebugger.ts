@@ -2,7 +2,7 @@ import {
 	LoggingDebugSession,
 	InitializedEvent, TerminatedEvent, OutputEvent,
 	Thread, StackFrame, Scope, Source, Handles, Breakpoint,
-	StoppedEvent
+	StoppedEvent,
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { basename } from 'path-browserify';
@@ -10,6 +10,9 @@ import { Subject } from 'await-notify';
 import { EventEmitter } from 'events';
 import * as childProcess from "child_process";
 import * as assert from 'assert';
+import * as path from 'path';
+import * as net from 'net';
+import { ZstdCodec } from 'zstd-codec';
 
 export interface LaunchRequest {
 	program: string;
@@ -40,24 +43,83 @@ const enum OutputKind {
 const enum DebuggerStatus {
 	starting,
 	command,
-	running,
+	executing,
 	stopped,
+}
+
+export enum MessageType {
+	Paused = 0,
+	Break = 1,
+	Result = 2,
+	Error = 3,
+	Continued = 4
+}
+
+export enum Command {
+	exit = 1,
+	break = 2,
+	trace = 6, // '\n' input frames
+	step = 7,
+	step_out = 8,
+	step_instruction = 9,
+	next = 10,
+	locals = 11, // '\n' input frames
+	params = 12, // '\n' input frames
+	upvalues = 13, // '\n' input frames
+	globals = 14, // '\n' input frames
+	run = 15,
+	restart = 16,
+	exception = 18, // '\n' input frames
+}
+
+export enum CommandBreak {
+	add = 1, // '\n' input frames
+	remove = 2 // '\n' input frames
+}
+
+export enum CommandLocals {
+	list = 1 // '\n' input frames
+}
+
+function createCommand(cmd: Command, args?: string): Buffer {
+	const buffer = Buffer.allocUnsafe(1 + (args ? args.length + 1 : 0));
+	buffer.writeUInt8(cmd, 0);
+	if (typeof args !== "undefined") {
+		buffer.write(args + "\n", 1, args.length + 1, undefined);
+	}
+	return buffer;
+}
+
+function createCommandSub(cmd: Command, sub: CommandBreak | CommandLocals, args?: string): Buffer {
+	const buffer = Buffer.allocUnsafe(1 + 1 + (args ? args.length + 1 : 0));
+	buffer.writeUInt8(cmd, 0);
+	buffer.writeUInt8(sub, 1);
+	if (typeof args !== "undefined") {
+		buffer.write(args + "\n", 2, args.length + 1, undefined);
+	}
+	return buffer;
 }
 
 type DebuggerStackFrame = { name?: string, src: string, line: number, context: number };
 type DebuggerExceptionInfo = { reason?: string, type?: string, kind: number };
-type DebuggerVariableInfo = { id: number, key: string, value: string, key_type: "literal" | string, value_type: string };
-
-const INPUT_TAG = "\x1b[0m(dbg) ";
-const OUTPUT_TAG = "\x1b[0m(dbg): ";
-const LARGEST_TAG_SIZE = Math.max(INPUT_TAG.length, OUTPUT_TAG.length);
+type DebuggerVariableValue = { value: string, type: string, zbase64?: string };
+type DebuggerVariableInfo = { id: number, key: DebuggerVariableValue, value: DebuggerVariableValue };
 
 export class ZuneDebugSession extends LoggingDebugSession {
-	private _variableHandles = new Handles<'locals' | 'params' | 'upvalues' | 'globals' | LuauVariable>();
+	private _variableHandles = new Handles<Command | LuauVariable>();
 	private _configurationDone = new Subject();
 	private _variables = new Map<string, LuauVariable & { ref: number }>();
+	private _memoryReferences: { [ref: string]: { uncompressed?: Buffer, zbase64: string } } = {};
+	private _memoryRefCount: number = 0;
+	private _zstd: any;
 
 	private process?: childProcess.ChildProcess = undefined;
+	private processCwd: string = "";
+	private debugServer?: net.Server;
+	private debugSocket?: net.Socket;
+
+	private zuneVersion?: string = undefined;
+	private luauVersion?: string = undefined;
 
 	private debuggerBuffer: string = "";
 	private debuggerOutputBuffer: string = "";
@@ -73,7 +135,6 @@ export class ZuneDebugSession extends LoggingDebugSession {
 	private pendingBreakpoints: boolean = false;
 	private currentScope: number = 0;
 
-	private currentCmd: string = "";
 
 	public constructor() {
 		super("zune-debug.txt");
@@ -87,6 +148,7 @@ export class ZuneDebugSession extends LoggingDebugSession {
 		response.body.supportsConfigurationDoneRequest = true;
 		response.body.supportsEvaluateForHovers = true;
 		response.body.supportsTerminateRequest = true;
+		response.body.supportsReadMemoryRequest = true;
 
 		response.body.supportsExceptionFilterOptions = true;
 		response.body.exceptionBreakpointFilters = [
@@ -107,6 +169,9 @@ export class ZuneDebugSession extends LoggingDebugSession {
 		];
 
 		response.body.supportsExceptionInfoRequest = true;
+
+		args.supportsVariableType = true;
+		args.supportsMemoryReferences = true;
 
 		this.sendResponse(response);
 		this.sendEvent(new InitializedEvent());
@@ -129,6 +194,8 @@ export class ZuneDebugSession extends LoggingDebugSession {
 	protected async launchRequest(response: DebugProtocol.LaunchResponse, args: ILaunchRequestArguments) {
 		await this._configurationDone.wait(5000);
 
+		this._zstd = new (await new Promise<any>(resolve => ZstdCodec.run(zstd => resolve(zstd)))).Simple();
+
 		const cwd = args.cwd;
 		const processOptions: childProcess.SpawnOptions = {
 			env: Object.assign({}, process.env),
@@ -136,15 +203,35 @@ export class ZuneDebugSession extends LoggingDebugSession {
 			shell: true,
 		};
 
-		const processArgs = ["debug", "--once", ...args.debuggerArgs || [], args.program, ...args.args || []];
+		this.debugServer = net.createServer((socket) => {
+			this.debugSocket = socket;
+			console.log('debug client connected');
+			socket.on('data', (data) => this.onRecieve(data));
+
+			socket.on('end', () => {
+				console.log('debug client disconnected');
+				this.onTerminated();
+			});
+
+			socket.on('error', (err) => {
+				console.error('Connection error:', err.message);
+			});
+		});
+
+		const port = await new Promise<number>((resolve) => this.debugServer?.listen(0, '127.0.0.1', () => {
+			resolve((this.debugServer?.address() as net.AddressInfo).port);
+		}));
+
+		const processArgs = ["debug", `--ipc-port=${port}`, "--once", ...args.debuggerArgs || [], args.program, ...args.args || []];
 		this.process = childProcess.spawn(args.debuggerPath, processArgs, processOptions);
+		this.processCwd = cwd;
 
 		console.log(`launching \`${args.debuggerPath} ${processArgs.join(" ")}\` from "${cwd}"`);
 
 		assert.ok(this.process.stdout);
 		assert.ok(this.process.stderr);
 		this.process.stdout.on("data", data => { this.sendOutput(`${data}`, OutputKind.stdout); });
-		this.process.stderr.on("data", data => { void this.onRecieve(data); });
+		this.process.stderr.on("data", data => { this.sendOutput(`${data}`, OutputKind.stderr); });
 
 		this.process.on("exit", () => this.onTerminated());
 		this.process.on("close", () => this.onTerminated());
@@ -156,33 +243,10 @@ export class ZuneDebugSession extends LoggingDebugSession {
 			this.debuggerStopped.notify();
 		});
 
-		this.debuggerOutputEvent.on('event', async (msg: string) => {
-			var result;
-			try {
-				result = JSON.parse(msg);
-			} catch (error) {
-				return;
-			}
-			if (typeof result !== "object") {
-				return;
-			}
-			if ('break' in result && typeof result.break === "number") {
-				var reason = "breakpoint";
-				if (result.break === 1) {
-					reason = "breakpoint";
-				} else if (result.break === 2) {
-					reason = "step";
-				} else if (result.break === 3 || result.break === 4) {
-					reason = "exception";
-				}
-
-				const evt: DebugProtocol.StoppedEvent = new StoppedEvent(reason, 1);
-				evt.body.allThreadsStopped = true;
-				this.sendEvent(evt);
-			}
-		});
-
 		await this.debuggerStopped.wait();
+
+		console.log(this.zuneVersion);
+		console.log(this.luauVersion);
 
 		await this.updateBreakpoints();
 
@@ -191,13 +255,6 @@ export class ZuneDebugSession extends LoggingDebugSession {
 			response.message = "Failed to start debugger (no response from debugger)";
 			response.success = false;
 			this.process?.kill("SIGKILL");
-		} else {
-			const mode = JSON.parse(await this.commandResult(`output json`));
-			if (typeof mode !== "object" || !('mode' in mode) || mode.mode !== "json") {
-				response.body = "Debugger responded but did not return in JSON mode";
-				response.message = "Failed to start debugger (debugger bad setup)";
-				response.success = false;
-			}
 		}
 
 		this.sendResponse(response);
@@ -207,7 +264,7 @@ export class ZuneDebugSession extends LoggingDebugSession {
 		}
 
 		if (!args.stopOnEntry) {
-			this.command(`run`);
+			this.command(createCommand(Command.run));
 		} else {
 			const evt: DebugProtocol.StoppedEvent = new StoppedEvent("entry");
 			evt.body.allThreadsStopped = true;
@@ -230,17 +287,17 @@ export class ZuneDebugSession extends LoggingDebugSession {
 		}
 		if (this.pendingException) {
 			this.pendingException = false;
-			await this.commandResult(`exception HandledError ${this.exceptionFilters.find((f) => f.filterId === 'HandledError') !== undefined}`);
-			await this.commandResult(`exception UnhandledError ${this.exceptionFilters.find((f) => f.filterId === 'UnhandledError') !== undefined}`);
+			await this.commandResult(createCommand(Command.exception, `HandledError ${this.exceptionFilters.find((f) => f.filterId === 'HandledError') !== undefined}`));
+			await this.commandResult(createCommand(Command.exception, `UnhandledError ${this.exceptionFilters.find((f) => f.filterId === 'UnhandledError') !== undefined}`));
 		}
 	}
 
 	private setBreakpoint(filePath: string, breakpoint: DebugProtocol.SourceBreakpoint) {
-		return this.commandResult(`break add ${filePath}:${breakpoint.line}`);
+		return this.commandResult(createCommandSub(Command.break, CommandBreak.add, `${filePath}:${breakpoint.line}`));
 	}
 
 	private deleteBreakpoint(filePath: string, breakpoint: DebugProtocol.SourceBreakpoint) {
-		return this.commandResult(`break rm ${filePath}:${breakpoint.line}`);
+		return this.commandResult(createCommandSub(Command.break, CommandBreak.remove, `${filePath}:${breakpoint.line}`));
 	}
 
 	protected async setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): Promise<void> {
@@ -282,8 +339,8 @@ export class ZuneDebugSession extends LoggingDebugSession {
 	}
 
 	protected async exceptionInfoRequest(response: DebugProtocol.ExceptionInfoResponse, args: DebugProtocol.ExceptionInfoArguments) {
-		const exception = JSON.parse(await this.commandResult(`exception`)) as DebuggerExceptionInfo;
-		const frames = JSON.parse(await this.commandResult(`trace 0`)) as DebuggerStackFrame[];
+		const exception = JSON.parse(await this.commandResult(createCommand(Command.exception, " "))) as DebuggerExceptionInfo;
+		const frames = JSON.parse(await this.commandResult(createCommand(Command.trace, `0`))) as DebuggerStackFrame[];
 
 		var stackframes = "";
 		for (const frame of frames) {
@@ -312,7 +369,7 @@ export class ZuneDebugSession extends LoggingDebugSession {
 	}
 
 	protected async stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
-		var frames = JSON.parse(await this.commandResult(`trace ${args.levels || 0}`)) as DebuggerStackFrame[];
+		var frames = JSON.parse(await this.commandResult(createCommand(Command.trace, `${args.levels || 0}`))) as DebuggerStackFrame[];
 		if (typeof frames !== "object") {
 			response.success = false;
 			response.message = "Failed to get stack trace";
@@ -337,7 +394,7 @@ export class ZuneDebugSession extends LoggingDebugSession {
 		const stackframes = frames.map((f, ix) => {
 			const src = Buffer.from(f.src, 'base64').toString();
 			if (f.context === 0 && f.src.length > 0 && f.src.charAt(0) !== '[') {
-				const sf: DebugProtocol.StackFrame = new StackFrame(shift + ix, f.name || "(entry)", new Source(basename(src), src, undefined, undefined), this.convertDebuggerLineToClient(f.line));
+				const sf: DebugProtocol.StackFrame = new StackFrame(shift + ix, f.name || "(entry)", new Source(basename(src), path.resolve(this.processCwd, src), undefined, undefined), this.convertDebuggerLineToClient(f.line));
 				return sf;
 			} else {
 				return new StackFrame(shift + ix, f.name || "(entry)", new Source(src, undefined, undefined, undefined), this.convertDebuggerLineToClient(f.line));
@@ -354,14 +411,44 @@ export class ZuneDebugSession extends LoggingDebugSession {
 	protected async scopesRequest(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): Promise<void> {
 		this._variables.clear();
 		this._variableHandles.reset();
+		this._memoryReferences = {};
+		this._memoryRefCount = 0;
 		const scopes: Scope[] = [
-			new Scope("Locals", this._variableHandles.create("locals"), false),
-			new Scope("Params", this._variableHandles.create("params"), false),
-			new Scope("Upvalues", this._variableHandles.create("upvalues"), true),
-			new Scope("Globals", this._variableHandles.create("globals"), true)
+			new Scope("Locals", this._variableHandles.create(Command.locals), false),
+			new Scope("Params", this._variableHandles.create(Command.params), false),
+			new Scope("Upvalues", this._variableHandles.create(Command.upvalues), true),
+			new Scope("Globals", this._variableHandles.create(Command.globals), true)
 		];
 		this.currentScope = args.frameId;
 		response.body = { scopes };
+		this.sendResponse(response);
+	}
+
+	protected async readMemoryRequest(response: DebugProtocol.ReadMemoryResponse, { offset = 0, count, memoryReference }: DebugProtocol.ReadMemoryArguments) {
+		const mem = this._memoryReferences[memoryReference];
+		if (!mem) {
+			response.success = false;
+			response.message = "Invalid memory reference";
+			this.sendResponse(response);
+			return;
+		}
+
+		if (!mem.uncompressed) {
+			const raw = Buffer.from(mem.zbase64, 'base64');
+			mem.uncompressed = Buffer.from(this._zstd.decompress(raw));
+		}
+
+		const memory = mem.uncompressed.subarray(
+			Math.min(offset, mem.uncompressed.length),
+			Math.min(offset + count, mem.uncompressed.length)
+		);
+
+		response.body = {
+			address: offset.toString(),
+			data: memory.toString('base64'),
+			unreadableBytes: count - memory.length,
+		};
+
 		this.sendResponse(response);
 	}
 
@@ -383,36 +470,60 @@ export class ZuneDebugSession extends LoggingDebugSession {
 		let varargIndex = 0;
 
 		const variable = this._variableHandles.get(args.variablesReference);
-		if (typeof variable === "string") {
-			const locals: DebuggerVariableInfo[] = JSON.parse(await this.commandResult(`${variable} list ${this.currentScope}`));
+		if (typeof variable === "object") {
 			var variables: DebugProtocol.Variable[] = [];
+			var luauVariables: LuauVariable[] = [];
+			luauVariables.push(variable);
+			var ctxVariable = variable;
+			var context: Command = Command.locals;
+			while (ctxVariable) {
+				const parent = this._variableHandles.get(ctxVariable.parent);
+				if (typeof parent === 'object') {
+					luauVariables.push(parent);
+					ctxVariable = parent;
+				} else {
+					context = parent;
+					break;
+				}
+			}
+			luauVariables.reverse();
+
+			var cmd = `${this.currentScope} `;
+			for (var i = 0; i < luauVariables.length; i++) {
+				if (i > 0) {
+					cmd += ',';
+				}
+				cmd += `${luauVariables[i].id}`;
+			}
+			const locals: DebuggerVariableInfo[] = JSON.parse(await this.commandResult(createCommandSub(context, CommandLocals.list, cmd)));
 			for (const value of locals) {
-				let rawKey = (variable === "globals") ? Buffer.from(value.key, 'base64').toString() : value.key;
-				rawKey = this.displayValue(rawKey, value.key_type);
-				let rawValue = Buffer.from(value.value, 'base64').toString();
-				if (variable === "params") {
-					if (rawKey === "var") {
-						rawKey = `var_arg${varargIndex++}`;
-					} else {
-						rawKey = `arg${paramIndex++}`;
-					}
+				const rawKey = Buffer.from(value.key.value, 'base64').toString();
+				const rawValue = Buffer.from(value.value.value, 'base64').toString();
+				var memoryReference: string | undefined = undefined;
+				if (value.value.zbase64) {
+					memoryReference = `${rawKey}.${this._memoryRefCount}`;
+					this._memoryRefCount++;
 				}
 				variables.push({
-					name: rawKey,
-					value: this.displayValue(rawValue, value.value_type),
-					type: value.value_type,
-					variablesReference: value.value_type === "table" ? this._variableHandles.create({
+					name: this.displayValue(rawKey, value.key.type),
+					value: this.displayValue(rawValue, value.value.type),
+					type: value.value.type,
+					variablesReference: value.value.type === "table" ? this._variableHandles.create({
 						id: value.id,
-						value: value.value,
-						type: value.value_type,
+						value: value.value.value,
+						type: value.value.type,
 						parent: args.variablesReference,
 					}) : 0,
+					memoryReference: memoryReference,
 				});
-				if (variable === "locals" || variable === "upvalues") {
+				if (memoryReference) {
+					this._memoryReferences[memoryReference] = { zbase64: value.value.zbase64! };
+				}
+				if (context === Command.locals || context === Command.upvalues) {
 					this._variables.set(rawKey, {
 						id: value.id,
-						value: value.value,
-						type: value.value_type,
+						value: value.value.value,
+						type: value.value.type,
 						parent: args.variablesReference,
 						ref: variables[variables.length - 1].variablesReference,
 					});
@@ -420,50 +531,44 @@ export class ZuneDebugSession extends LoggingDebugSession {
 			}
 			response.body = { variables };
 		} else if (variable) {
+			const locals: DebuggerVariableInfo[] = JSON.parse(await this.commandResult(createCommandSub(variable, CommandLocals.list, `${this.currentScope}`)));
 			var variables: DebugProtocol.Variable[] = [];
-			var luauVariables: LuauVariable[] = [];
-			luauVariables.push(variable);
-			var ctxVariable = variable;
-			var context = "locals";
-			while (ctxVariable) {
-				const parent = this._variableHandles.get(ctxVariable.parent);
-				if (typeof parent === 'object') {
-					luauVariables.push(parent);
-					ctxVariable = parent;
-				} else {
-					context = parent as string;
-					break;
-				}
-			}
-			luauVariables.reverse();
-
-			var cmd = `${context} list ${this.currentScope} `;
-			for (var i = 0; i < luauVariables.length; i++) {
-				if (i > 0) {
-					cmd += ',';
-				}
-				cmd += `${luauVariables[i].id}`;
-			}
-			const locals: DebuggerVariableInfo[] = JSON.parse(await this.commandResult(cmd));
 			for (const value of locals) {
-				const rawKey = Buffer.from(value.key, 'base64').toString();
-				const rawValue = Buffer.from(value.value, 'base64').toString();
+				let rawKey = (variable === Command.globals) ? Buffer.from(value.key.value, 'base64').toString() : value.key.value;
+				rawKey = this.displayValue(rawKey, value.key.type);
+				let rawValue = Buffer.from(value.value.value, 'base64').toString();
+				if (variable === Command.params) {
+					if (rawKey === "var") {
+						rawKey = `var_arg${varargIndex++}`;
+					} else {
+						rawKey = `arg${paramIndex++}`;
+					}
+				}
+				var memoryReference: string | undefined = undefined;
+				if (value.value.zbase64) {
+					memoryReference = `${rawKey}.${this._memoryRefCount}`;
+					this._memoryRefCount++;
+				}
 				variables.push({
-					name: this.displayValue(rawKey, value.key_type),
-					value: this.displayValue(rawValue, value.value_type),
-					type: value.value_type,
-					variablesReference: value.value_type === "table" ? this._variableHandles.create({
+					name: rawKey,
+					value: this.displayValue(rawValue, value.value.type),
+					type: value.value.type,
+					variablesReference: value.value.type === "table" ? this._variableHandles.create({
 						id: value.id,
-						value: value.value,
-						type: value.value_type,
+						value: value.value.value,
+						type: value.value.type,
 						parent: args.variablesReference,
 					}) : 0,
+					memoryReference: memoryReference,
 				});
-				if (context === "locals" || context === "upvalues") {
+				if (memoryReference) {
+					this._memoryReferences[memoryReference] = { zbase64: value.value.zbase64! };
+				}
+				if (variable === Command.locals || variable === Command.upvalues) {
 					this._variables.set(rawKey, {
 						id: value.id,
-						value: value.value,
-						type: value.value_type,
+						value: value.value.value,
+						type: value.value.type,
 						parent: args.variablesReference,
 						ref: variables[variables.length - 1].variablesReference,
 					});
@@ -477,25 +582,25 @@ export class ZuneDebugSession extends LoggingDebugSession {
 
 	protected async continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): Promise<void> {
 		await this.updateBreakpoints();
-		await this.command("run");
+		await this.command(createCommand(Command.run));
 		this.sendResponse(response);
 	}
 
 	protected async nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
 		await this.updateBreakpoints();
-		await this.commandResult(`next`);
+		await this.commandResult(createCommand(Command.next));
 		this.sendResponse(response);
 	}
 
 	protected async stepInRequest(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): Promise<void> {
 		await this.updateBreakpoints();
-		await this.commandResult(`step`);
+		await this.commandResult(createCommand(Command.step));
 		this.sendResponse(response);
 	}
 
 	protected async stepOutRequest(response: DebugProtocol.StepOutResponse, args: DebugProtocol.StepOutArguments): Promise<void> {
 		await this.updateBreakpoints();
-		await this.commandResult(`stepout`);
+		await this.commandResult(createCommand(Command.step_out));
 		this.sendResponse(response);
 	}
 
@@ -557,83 +662,114 @@ export class ZuneDebugSession extends LoggingDebugSession {
 		}
 	}
 
-	private onRecieve(data: unknown) {
-		const str: string = data instanceof Buffer ? data.toString() : typeof data === "string" ? data : `${data}`;
-		this.debuggerBuffer += str;
+	private onRecieve(data?: unknown) {
+		if (data) {
+			const str: string = data instanceof Buffer ? data.toString() : typeof data === "string" ? data : `${data}`;
+			this.debuggerBuffer += str;
+		}
 
 		if (this.debuggerBuffer.length === 0) {
 			return;
 		}
 
-		if (this.currentCmd.length > 0) {
-			const cutoff = Math.min(this.debuggerBuffer.length, this.currentCmd.length);
-			if (cutoff === 0) {
-				return;
+		if (this.zuneVersion === undefined || this.luauVersion === undefined) {
+			const line = this.debuggerBuffer.indexOf(`\n`);
+			if (line >= 0) {
+				const version_string = this.debuggerBuffer.substring(0, line);
+				this.debuggerBuffer = this.debuggerBuffer.substring(line + 1);
+				if (this.zuneVersion === undefined) {
+					this.zuneVersion = version_string;
+					this.onRecieve();
+					return;
+				}
+				if (this.luauVersion === undefined) {
+					this.luauVersion = version_string;
+					this.onRecieve();
+					return;
+				}
 			}
-			this.currentCmd = this.currentCmd.substring(cutoff);
-			this.debuggerBuffer = this.debuggerBuffer.substring(cutoff);
-			if (this.debuggerBuffer.length > 0) {
-				this.onRecieve("");
-			}
-			return;
 		}
 
-		const index = this.debuggerBuffer.indexOf(`\x1b`);
-		if (index === -1) {
-			this.sendOutput(this.debuggerBuffer, OutputKind.stderr);
-			this.debuggerBuffer = "";
-			return;
-		}
+		const type: MessageType = this.debuggerBuffer.charCodeAt(0);
 
-		const cmd = this.debuggerBuffer.substring(index);
-		if (index > 0) {
-			this.sendOutput(this.debuggerBuffer.substring(0, index), OutputKind.stderr);
-			this.debuggerBuffer = cmd;
-		}
+		switch (type) {
+			case MessageType.Paused:
+				this.debuggerBuffer = this.debuggerBuffer.substring(1);
+				this.debuggerInputEvent.emit('event');
+				this.onRecieve();
+				break;
+			case MessageType.Break:
+				// consume until `\n`
+				const breakIndex = this.debuggerBuffer.indexOf(`\n`);
+				if (breakIndex >= 0) {
+					const breakInfo = this.debuggerBuffer.substring(1, breakIndex);
+					this.debuggerBuffer = this.debuggerBuffer.substring(breakIndex + 1);
+					const result = JSON.parse(breakInfo);
+					if ('break' in result && typeof result.break === "number") {
+						var reason = "breakpoint";
+						if (result.break === 1) {
+							reason = "breakpoint";
+						} else if (result.break === 2) {
+							reason = "step";
+						} else if (result.break === 3 || result.break === 4) {
+							reason = "exception";
+						}
 
-		var matched = false;
-		if (cmd.startsWith(INPUT_TAG)) {
-			this.debuggerInputEvent.emit('event');
-			this.debuggerBuffer = "";
-			matched = true;
-		} else if (cmd.startsWith(OUTPUT_TAG)) {
-			const index = cmd.indexOf(`\n`);
-			if (index >= 0) {
-				const output = cmd.substring(OUTPUT_TAG.length, index);
-				this.debuggerOutputEvent.emit('event', output);
-				this.debuggerBuffer = cmd.substring(index + 1);
-				this.onRecieve("");
-				return;
-			}
-			matched = true;
-		}
-
-		if (!matched && cmd.length >= LARGEST_TAG_SIZE) {
-			this.sendOutput(cmd[0], OutputKind.stderr);
-			this.debuggerBuffer = cmd.substring(1);
-			this.onRecieve("");
+						const evt: DebugProtocol.StoppedEvent = new StoppedEvent(reason, 1);
+						evt.body.allThreadsStopped = true;
+						this.sendEvent(evt);
+					}
+					this.onRecieve();
+				}
+				break;
+			case MessageType.Result:
+				const index = this.debuggerBuffer.indexOf(`\n`);
+				if (index >= 0) {
+					const output = this.debuggerBuffer.substring(1, index);
+					this.debuggerBuffer = this.debuggerBuffer.substring(index + 1);
+					this.debuggerOutputEvent.emit('event', output);
+					this.debuggerInputEvent.emit('event');
+					this.onRecieve();
+				}
+				break;
+			case MessageType.Continued:
+				this.debuggerBuffer = this.debuggerBuffer.substring(1);
+				this.onRecieve();
+				break;
+			case MessageType.Error:
+				const errIndex = this.debuggerBuffer.indexOf(`\n`);
+				if (errIndex >= 0) {
+					const output = this.debuggerBuffer.substring(1, errIndex);
+					this.debuggerBuffer = this.debuggerBuffer.substring(errIndex + 1);
+					console.error(`debug client error: ${output}`);
+					this.debuggerInputEvent.emit('event');
+					this.onRecieve();
+				}
+				break;
+			default:
+				console.error(`unknown message type: ${type}`);
+				this.debuggerBuffer = "";
+				break;
 		}
 	}
 
-	private async command(cmd: string): Promise<void> {
+	private async command(cmd: Buffer): Promise<void> {
 		assert.ok(this.process, "process is undefined");
-		while (this.debuggerStatus === DebuggerStatus.command || this.debuggerStatus !== DebuggerStatus.stopped) {
+		assert.ok(this.debugSocket, "socket is undefined");
+		if (this.debuggerStatus !== DebuggerStatus.stopped) {
 			await this.debuggerStopped.wait();
 		}
 
-		this.debuggerStatus = DebuggerStatus.command;
+		this.debuggerStatus = DebuggerStatus.executing;
 
-		if (cmd.startsWith("run") || cmd.startsWith("next") || cmd.startsWith("step") || cmd.startsWith("stepout")) {
-			this.debuggerStatus = DebuggerStatus.running;
-		}
-
-		const write = `${cmd}\n`;
-		this.currentCmd = write;
-		assert.ok(this.process.stdin);
-		this.process.stdin.write(write);
+		this.debugSocket.write(cmd, (err) => {
+			if (err) {
+				console.error("failed to send command to debugger client:", err);
+			}
+		});
 	}
 
-	private async commandResult(cmd: string): Promise<string> {
+	private async commandResult(cmd: Buffer): Promise<string> {
 		await this.command(cmd);
 		return new Promise(resolve => this.debuggerOutputEvent.once('event', resolve));
 	}

@@ -1,9 +1,9 @@
 {
   "name": "zune-debugger-vscode",
-  "displayName": "Zune Luau Debugger",
-  "version": "0.0.1",
+  "displayName": "ZUNE Luau Debugger",
+  "version": "0.0.2",
   "publisher": "Sythivo",
-  "description": "Luau Debugger powered by Zune",
+  "description": "Luau debugger powered by zune",
   "author": {
     "name": "Sythivo"
   },
@@ -34,18 +34,20 @@
     "publish": "vsce publish"
   },
   "devDependencies": {
-    "@types/node": "^14.14.37",
+    "@types/node": "^14.18.63",
     "@types/vscode": "^1.66.0",
     "@typescript-eslint/eslint-plugin": "^5.17.0",
     "@typescript-eslint/parser": "^5.17.0",
-    "@vscode/debugadapter": "^1.56.0",
+    "@vscode/debugadapter": "^1.68.0",
+    "@vscode/debugprotocol": "^1.68.0",
     "await-notify": "^1.0.1",
     "esbuild": "^0.14.29",
     "eslint": "^8.12.0",
     "events": "^3.3.0",
     "path-browserify": "^1.0.1",
     "typescript": "^4.6.3",
-    "vsce": "^2.7.0"
+    "vsce": "^2.7.0",
+    "zstd-codec": "^0.1.5"
   },
   "main": "./dist/extension.js",
   "activationEvents": [
@@ -70,7 +72,7 @@
           "luau",
           "lua"
         ],
-        "label": "Zune Luau Debugger",
+        "label": "zune luau debugger",
         "program": "./out/debugAdapter.js",
         "runtime": "node",
         "configurationAttributes": {
@@ -124,7 +126,7 @@
         ],
         "configurationSnippets": [
           {
-            "label": "Zune Debug: Launch",
+            "label": "zune Debug: Launch",
             "description": "A new configuration to debug luau file.",
             "body": {
               "type": "zune-luau",

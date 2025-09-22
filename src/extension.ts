@@ -82,9 +82,6 @@ class ZuneDebugAdapterConfigurationProvider implements vscode.DebugConfiguration
 		if (!config.debuggerPath) {
 			config.debuggerPath = "zune";
 		}
-		if (!config.cwd) {
-			config.cwd = config.workspacePath;
-		}
 
 		if (folder) {
 			config.workspacePath = folder.uri.fsPath;
@@ -92,6 +89,10 @@ class ZuneDebugAdapterConfigurationProvider implements vscode.DebugConfiguration
 			config.workspacePath = path.dirname(vscode.window.activeTextEditor.document.uri.fsPath);
 		} else {
 			return void vscode.window.showErrorMessage("No path found for the workspace");
+		}
+
+		if (!config.cwd) {
+			config.cwd = config.workspacePath;
 		}
 
 		return config;
